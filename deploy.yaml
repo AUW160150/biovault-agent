@@ -1,0 +1,73 @@
+---
+# BioVault Agent — Akash Network SDL Deployment File
+# Image is built automatically by GitHub Actions and pushed to ghcr.io
+# Deploy via: https://console.akash.network → New Deployment → paste this SDL
+
+version: "2.0"
+
+services:
+  biovault-agent:
+    image: ghcr.io/auw160150/biovault-agent:latest
+    expose:
+      - port: 8000
+        as: 80
+        to:
+          - global: true
+    env:
+      # ── AkashML Inference ────────────────────────────────────────────────────
+      - AKASH_API_KEY=akml-ndcdjOQZIqVktRPPgNQAKcDYOriDLjbc
+      - AKASH_BASE_URL=https://api.akashml.com/v1
+      - AKASH_MODEL=MiniMaxAI/MiniMax-M2.5
+
+      # ── MiniMax Vision (document extraction) ─────────────────────────────────
+      - MINIMAX_API_KEY=sk-api-18aPFrqYYhqNScFhkr2icVVkL5XU16jT5RNuP9DRVTcINev270UlYTj8BWywvGMNlcmUBK2kFAz_TgitTCE4hAbPSQ-ffyjlw0ZURRtvdTiTTx1cyCCbDpk
+      - MINIMAX_GROUP_ID=2002432493461966898
+      - MINIMAX_BASE_URL=https://api.minimax.io/v1
+
+      # ── Datadog Observability (optional) ─────────────────────────────────────
+      - DD_API_KEY=be5221d415346d8969ea5fca2ecbdb1d
+      - DD_SITE=us5.datadoghq.com
+      - DD_SERVICE=biovault-agent
+      - DD_ENV=production
+
+      # ── Storage (mapped to persistent volume below) ───────────────────────────
+      - DB_PATH=/data/biovault.db
+      - UPLOAD_DIR=/data/uploads
+
+      # ── Agent tuning ─────────────────────────────────────────────────────────
+      - POLL_INTERVAL_SECONDS=30
+
+    params:
+      storage:
+        data:
+          mount: /data
+          readOnly: false
+
+profiles:
+  compute:
+    biovault-agent:
+      resources:
+        cpu:
+          units: 1.0
+        memory:
+          size: 2Gi
+        storage:
+          - size: 1Gi
+          - name: data
+            size: 10Gi
+            attributes:
+              persistent: true
+              class: beta3
+
+  placement:
+    dcloud:
+      pricing:
+        biovault-agent:
+          denom: uakt
+          amount: 10000
+
+deployment:
+  biovault-agent:
+    dcloud:
+      profile: biovault-agent
+      count: 1
