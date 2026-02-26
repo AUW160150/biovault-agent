@@ -156,7 +156,7 @@ def standardize_extraction(raw_extraction: dict, tracer=None) -> dict:
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.0,
-        "max_tokens": 4096,
+        "max_tokens": 8192,
     }
 
     headers = {
@@ -187,16 +187,11 @@ def standardize_extraction(raw_extraction: dict, tracer=None) -> dict:
     input_tokens = usage.get("prompt_tokens", 0)
     output_tokens = usage.get("completion_tokens", 0)
 
-    # Strip any reasoning tags (e.g. <think>…</think>) some models emit
+    # Strip reasoning tags and clean the response
     raw_content = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).strip()
 
     json_str = _extract_json(raw_content)
-    try:
-        standardized = json.loads(json_str)
-    except json.JSONDecodeError as e:
-        raise ValueError(
-            f"AkashML returned invalid JSON: {e}\nRaw content (first 500): {raw_content[:500]}"
-        )
+    standardized = _parse_with_retry(json_str, raw_content, payload, headers)
 
     logger.info(
         "AkashML standardization complete: latency=%dms in=%d out=%d",
@@ -220,6 +215,98 @@ def standardize_extraction(raw_extraction: dict, tracer=None) -> dict:
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
     }
+
+
+def _parse_with_retry(json_str: str, raw_content: str, payload: dict, headers: dict) -> dict:
+    """
+    Try to parse JSON. On failure:
+      1. Attempt to repair truncated/broken JSON by closing open structures.
+      2. Strip non-ASCII characters that models sometimes emit (arrows, em-dashes).
+      3. Retry the API call once with an explicit repair prompt.
+    """
+    # Attempt 1 — direct parse
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 2 — sanitise and repair
+    repaired = _repair_json(json_str)
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 3 — retry the API with an explicit "fix it" prompt
+    logger.warning("JSON parse failed — retrying AkashML with repair prompt")
+    repair_payload = dict(payload)
+    repair_payload["messages"] = [
+        {"role": "system", "content": "You are a JSON repair assistant. Fix the broken JSON and return ONLY valid JSON — no markdown, no explanation."},
+        {"role": "user", "content": f"This JSON is broken at a specific character. Fix it and return valid JSON only:\n\n{raw_content[:2000]}"},
+    ]
+    repair_payload["max_tokens"] = 8192
+    repair_payload["temperature"] = 0.0
+    try:
+        with httpx.Client(timeout=120.0) as client:
+            r = client.post(
+                f"{AKASH_BASE_URL}/chat/completions",
+                json=repair_payload,
+                headers=headers,
+            )
+            r.raise_for_status()
+        retry_content = r.json()["choices"][0]["message"]["content"]
+        retry_content = re.sub(r"<think>.*?</think>", "", retry_content, flags=re.DOTALL).strip()
+        return json.loads(_extract_json(retry_content))
+    except Exception as e:
+        raise ValueError(
+            f"AkashML returned invalid JSON (all repair attempts failed): {e}\n"
+            f"Raw content (first 500): {raw_content[:500]}"
+        )
+
+
+def _repair_json(text: str) -> str:
+    """
+    Best-effort JSON repair:
+    - Replace unicode arrows/dashes with ASCII equivalents
+    - Remove stray control characters
+    - Close unclosed arrays and objects
+    """
+    # Replace common unicode chars models emit inside strings
+    replacements = {
+        "\u2192": "->",   # →
+        "\u2190": "<-",   # ←
+        "\u2013": "-",    # –
+        "\u2014": "-",    # —
+        "\u2018": "'",    # '
+        "\u2019": "'",    # '
+        "\u201c": '"',    # "
+        "\u201d": '"',    # "
+    }
+    for char, replacement in replacements.items():
+        text = text.replace(char, replacement)
+
+    # Strip non-printable control characters (keep \n \t)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+
+    # Try to close unclosed structures by tracking open brackets
+    open_strings = False
+    stack = []
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c == '"' and (i == 0 or text[i-1] != "\\"):
+            open_strings = not open_strings
+        elif not open_strings:
+            if c in "{[":
+                stack.append("}" if c == "{" else "]")
+            elif c in "}]" and stack:
+                stack.pop()
+        i += 1
+
+    # Close any unclosed structures
+    text = text.rstrip(", \n\t")
+    text += "".join(reversed(stack))
+    return text
 
 
 def _extract_json(text: str) -> str:
